@@ -1,0 +1,595 @@
+import {
+  Component as ClassComponent,
+  ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from 'react'
+import { act, fireEvent, render } from '@testing-library/react'
+import ReactDOM from 'react-dom'
+import {create} from '../src/index'
+
+const consoleError = console.error
+afterEach(() => {
+  console.error = consoleError
+})
+
+it('creates a store hook and api object', () => {
+  let params
+  const result = create((...args) => {
+    params = args
+    return { value: null }
+  })
+  expect({ params, result }).toMatchInlineSnapshot(`
+    Object {
+      "params": Array [
+        [Function],
+        [Function],
+        Object {
+          "destroy": [Function],
+          "getState": [Function],
+          "setState": [Function],
+          "subscribe": [Function],
+        },
+      ],
+      "result": [Function],
+    }
+  `)
+})
+
+type CounterState = {
+  count: number
+  inc: () => void
+}
+
+it('uses the store with no args', async () => {
+  const useStore = create<CounterState>((set) => ({
+    count: 0,
+    inc: () => set((state) => ({ count: state.count + 1 })),
+  }))
+
+  function Counter() {
+    const { count, inc } = useStore()
+    useEffect(inc, [inc])
+    return <div>count: {count}</div>
+  }
+
+  const { findByText } = render(<Counter />)
+
+  await findByText('count: 1')
+})
+
+it('uses the store with selectors', async () => {
+  const useStore = create<CounterState>((set) => ({
+    count: 0,
+    inc: () => set((state) => ({ count: state.count + 1 })),
+  }))
+
+  function Counter() {
+    const count = useStore((s) => s.count)
+    const inc = useStore((s) => s.inc)
+    useEffect(inc, [inc])
+    return <div>count: {count}</div>
+  }
+
+  const { findByText } = render(<Counter />)
+
+  await findByText('count: 1')
+})
+
+it('uses the store with a selector and equality checker', async () => {
+  const useStore = create(() => ({ item: { value: 0 } }))
+  const { setState } = useStore
+  let renderCount = 0
+
+  function Component() {
+    // Prevent re-render if new value === 1.
+    const item = useStore(
+      (s) => s.item,
+      (_, newItem) => newItem.value === 1
+    )
+    return (
+      <div>
+        renderCount: {++renderCount}, value: {item.value}
+      </div>
+    )
+  }
+
+  const { findByText } = render(<Component />)
+
+  await findByText('renderCount: 1, value: 0')
+
+  // This will not cause a re-render.
+  act(() => setState({ item: { value: 1 } }))
+  await findByText('renderCount: 1, value: 0')
+
+  // This will cause a re-render.
+  act(() => setState({ item: { value: 2 } }))
+  await findByText('renderCount: 2, value: 2')
+})
+
+it('only re-renders if selected state has changed', async () => {
+  const useStore = create<CounterState>((set) => ({
+    count: 0,
+    inc: () => set((state) => ({ count: state.count + 1 })),
+  }))
+  let counterRenderCount = 0
+  let controlRenderCount = 0
+
+  function Counter() {
+    const count = useStore((state) => state.count)
+    counterRenderCount++
+    return <div>count: {count}</div>
+  }
+
+  function Control() {
+    const inc = useStore((state) => state.inc)
+    controlRenderCount++
+    return <button onClick={inc}>button</button>
+  }
+
+  const { getByText, findByText } = render(
+    <>
+      <Counter />
+      <Control />
+    </>
+  )
+
+  fireEvent.click(getByText('button'))
+
+  await findByText('count: 1')
+
+  expect(counterRenderCount).toBe(2)
+  expect(controlRenderCount).toBe(1)
+})
+
+it('re-renders with useLayoutEffect', async () => {
+  const useStore = create(() => ({ state: false }))
+
+  function Component() {
+    const { state } = useStore()
+    useLayoutEffect(() => {
+      useStore.setState({ state: true })
+    }, [])
+    return <>{`${state}`}</>
+  }
+
+  const container = document.createElement('div')
+  ReactDOM.render(<Component />, container)
+  expect(container.innerHTML).toBe('true')
+  ReactDOM.unmountComponentAtNode(container)
+})
+
+it('can batch updates', async () => {
+  const useStore = create<CounterState>((set) => ({
+    count: 0,
+    inc: () => set((state) => ({ count: state.count + 1 })),
+  }))
+
+  function Counter() {
+    const { count, inc } = useStore()
+    useEffect(() => {
+      ReactDOM.unstable_batchedUpdates(() => {
+        inc()
+        inc()
+      })
+    }, [inc])
+    return <div>count: {count}</div>
+  }
+
+  const { findByText } = render(<Counter />)
+
+  await findByText('count: 2')
+})
+
+it('can update the selector', async () => {
+  type State = { one: string; two: string }
+  type Props = { selector: StateSelector<State, string> }
+  const useStore = create<State>(() => ({
+    one: 'one',
+    two: 'two',
+  }))
+
+  function Component({ selector }: Props) {
+    return <div>{useStore(selector)}</div>
+  }
+
+  const { findByText, rerender } = render(<Component selector={(s) => s.one} />)
+  await findByText('one')
+
+  rerender(<Component selector={(s) => s.two} />)
+  await findByText('two')
+})
+
+it('can update the equality checker', async () => {
+  type State = { value: number }
+  type Props = { equalityFn: EqualityChecker<number> }
+  const useStore = create<State>(() => ({ value: 0 }))
+  const { setState } = useStore
+  const selector: StateSelector<State, number> = (s) => s.value
+
+  let renderCount = 0
+  function Component({ equalityFn }: Props) {
+    const value = useStore(selector, equalityFn)
+    return (
+      <div>
+        renderCount: {++renderCount}, value: {value}
+      </div>
+    )
+  }
+
+  // Set an equality checker that always returns false to always re-render.
+  const { findByText, rerender } = render(
+    <Component equalityFn={() => false} />
+  )
+
+  // This will cause a re-render due to the equality checker.
+  act(() => setState({ value: 0 }))
+  await findByText('renderCount: 2, value: 0')
+
+  // Set an equality checker that always returns true to never re-render.
+  rerender(<Component equalityFn={() => true} />)
+
+  // This will NOT cause a re-render due to the equality checker.
+  act(() => setState({ value: 1 }))
+  await findByText('renderCount: 3, value: 0')
+})
+
+it('can call useStore with progressively more arguments', async () => {
+  type State = { value: number }
+  type Props = {
+    selector?: StateSelector<State, number>
+    equalityFn?: EqualityChecker<number>
+  }
+
+  const useStore = create<State>(() => ({ value: 0 }))
+  const { setState } = useStore
+
+  let renderCount = 0
+  function Component({ selector, equalityFn }: Props) {
+    const value = useStore(selector as any, equalityFn)
+    return (
+      <div>
+        renderCount: {++renderCount}, value: {JSON.stringify(value)}
+      </div>
+    )
+  }
+
+  // Render with no args.
+  const { findByText, rerender } = render(<Component />)
+  await findByText('renderCount: 1, value: {"value":0}')
+
+  // Render with selector.
+  rerender(<Component selector={(s) => s.value} />)
+  await findByText('renderCount: 2, value: 0')
+
+  // Render with selector and equality checker.
+  rerender(
+    <Component
+      selector={(s) => s.value}
+      equalityFn={(oldV, newV) => oldV > newV}
+    />
+  )
+
+  // Should not cause a re-render because new value is less than previous.
+  act(() => setState({ value: -1 }))
+  await findByText('renderCount: 3, value: 0')
+
+  act(() => setState({ value: 1 }))
+  await findByText('renderCount: 4, value: 1')
+})
+
+it('can throw an error in selector', async () => {
+  console.error = jest.fn()
+  type State = { value: string | number }
+
+  const initialState: State = { value: 'foo' }
+  const useStore = create<State>(() => initialState)
+  const { setState } = useStore
+  const selector: StateSelector<State, string | void> = (s) =>
+    // @ts-expect-error This function is supposed to throw an error
+    s.value.toUpperCase()
+
+  class ErrorBoundary extends ClassComponent<
+    { children?: ReactNode | undefined },
+    { hasError: boolean }
+  > {
+    constructor(props: { children?: ReactNode | undefined }) {
+      super(props)
+      this.state = { hasError: false }
+    }
+    static getDerivedStateFromError() {
+      return { hasError: true }
+    }
+    render() {
+      return this.state.hasError ? <div>errored</div> : this.props.children
+    }
+  }
+
+  function Component() {
+    useStore(selector)
+    return <div>no error</div>
+  }
+
+  const { findByText } = render(
+    <ErrorBoundary>
+      <Component />
+    </ErrorBoundary>
+  )
+  await findByText('no error')
+
+  act(() => {
+    setState({ value: 123 })
+  })
+  await findByText('errored')
+})
+
+it('can throw an error in equality checker', async () => {
+  console.error = jest.fn()
+  type State = { value: string | number }
+
+  const initialState: State = { value: 'foo' }
+  const useStore = create(() => initialState)
+  const { setState } = useStore
+  const selector: StateSelector<State, State> = (s) => s
+  const equalityFn: EqualityChecker<State> = (a, b) =>
+    // @ts-expect-error This function is supposed to throw an error
+    a.value.trim() === b.value.trim()
+
+  class ErrorBoundary extends ClassComponent<
+    { children?: ReactNode | undefined },
+    { hasError: boolean }
+  > {
+    constructor(props: { children?: ReactNode | undefined }) {
+      super(props)
+      this.state = { hasError: false }
+    }
+    static getDerivedStateFromError() {
+      return { hasError: true }
+    }
+    render() {
+      return this.state.hasError ? <div>errored</div> : this.props.children
+    }
+  }
+
+  function Component() {
+    useStore(selector, equalityFn)
+    return <div>no error</div>
+  }
+
+  const { findByText } = render(
+    <ErrorBoundary>
+      <Component />
+    </ErrorBoundary>
+  )
+  await findByText('no error')
+
+  act(() => {
+    setState({ value: 123 })
+  })
+  await findByText('errored')
+})
+
+it('can get the store', () => {
+  type State = {
+    value: number
+    getState1: () => State
+    getState2: () => State
+  }
+  const { getState } = create<State>((_, get) => ({
+    value: 1,
+    getState1: () => get(),
+    getState2: (): State => getState(),
+  }))
+
+  expect(getState().getState1().value).toBe(1)
+  expect(getState().getState2().value).toBe(1)
+})
+
+it('can set the store', () => {
+  type State = {
+    value: number
+    setState1: SetState<State>
+    setState2: SetState<State>
+  }
+
+  const { setState, getState } = create<State>((set) => ({
+    value: 1,
+    setState1: (v) => set(v),
+    setState2: (v) => setState(v),
+  }))
+
+  getState().setState1({ value: 2 })
+  expect(getState().value).toBe(2)
+  getState().setState2({ value: 3 })
+  expect(getState().value).toBe(3)
+  getState().setState1((s) => ({ value: ++s.value }))
+  expect(getState().value).toBe(4)
+  getState().setState2((s) => ({ value: ++s.value }))
+  expect(getState().value).toBe(5)
+})
+
+it('can set the store without merging', () => {
+  const { setState, getState } = create<{ a: number } | { b: number }>(
+    (_set) => ({
+      a: 1,
+    })
+  )
+
+  // Should override the state instead of merging.
+  setState({ b: 2 }, true)
+  expect(getState()).toEqual({ b: 2 })
+})
+
+it('can destroy the store', () => {
+  const { destroy, getState, setState, subscribe } = create(() => ({
+    value: 1,
+  }))
+
+  subscribe(() => {
+    throw new Error('did not clear listener on destroy')
+  })
+  destroy()
+
+  setState({ value: 2 })
+  expect(getState().value).toEqual(2)
+})
+
+it('only calls selectors when necessary', async () => {
+  type State = { a: number; b: number }
+  const useStore = create<State>(() => ({ a: 0, b: 0 }))
+  const { setState } = useStore
+  let inlineSelectorCallCount = 0
+  let staticSelectorCallCount = 0
+
+  function staticSelector(s: State) {
+    staticSelectorCallCount++
+    return s.a
+  }
+
+  function Component() {
+    useStore((s) => (inlineSelectorCallCount++, s.b))
+    useStore(staticSelector)
+    return (
+      <>
+        <div>inline: {inlineSelectorCallCount}</div>
+        <div>static: {staticSelectorCallCount}</div>
+      </>
+    )
+  }
+
+  const { rerender, findByText } = render(<Component />)
+  await findByText('inline: 1')
+  await findByText('static: 1')
+
+  rerender(<Component />)
+  await findByText('inline: 2')
+  await findByText('static: 1')
+
+  act(() => setState({ a: 1, b: 1 }))
+  await findByText('inline: 4')
+  await findByText('static: 2')
+})
+
+it('ensures parent components subscribe before children', async () => {
+  type State = {
+    children: { [key: string]: { text: string } }
+  }
+  type Props = { id: string }
+  const useStore = create<State>(() => ({
+    children: {
+      '1': { text: 'child 1' },
+      '2': { text: 'child 2' },
+    },
+  }))
+  const api = useStore
+
+  function changeState() {
+    api.setState({
+      children: {
+        '3': { text: 'child 3' },
+      },
+    })
+  }
+
+  function Child({ id }: Props) {
+    const text = useStore((s) => s.children[id]?.text)
+    return <div>{text}</div>
+  }
+
+  function Parent() {
+    const childStates = useStore((s) => s.children)
+    return (
+      <>
+        <button onClick={changeState}>change state</button>
+        {Object.keys(childStates).map((id) => (
+          <Child id={id} key={id} />
+        ))}
+      </>
+    )
+  }
+
+  const { getByText, findByText } = render(<Parent />)
+
+  fireEvent.click(getByText('change state'))
+
+  await findByText('child 3')
+})
+
+// https://github.com/pmndrs/zustand/issues/84
+it('ensures the correct subscriber is removed on unmount', async () => {
+  const useStore = create(() => ({ count: 0 }))
+  const api = useStore
+
+  function increment() {
+    api.setState(({ count }) => ({ count: count + 1 }))
+  }
+
+  function Count() {
+    const c = useStore((s) => s.count)
+    return <div>count: {c}</div>
+  }
+
+  function CountWithInitialIncrement() {
+    useLayoutEffect(increment, [])
+    return <Count />
+  }
+
+  function Component() {
+    const [Counter, setCounter] = useState(() => CountWithInitialIncrement)
+    useLayoutEffect(() => {
+      setCounter(() => Count)
+    }, [])
+    return (
+      <>
+        <Counter />
+        <Count />
+      </>
+    )
+  }
+
+  const { findAllByText } = render(<Component />)
+
+  expect((await findAllByText('count: 1')).length).toBe(2)
+
+  act(increment)
+
+  expect((await findAllByText('count: 2')).length).toBe(2)
+})
+
+// https://github.com/pmndrs/zustand/issues/86
+it('ensures a subscriber is not mistakenly overwritten', async () => {
+  const useStore = create(() => ({ count: 0 }))
+  const { setState } = useStore
+
+  function Count1() {
+    const c = useStore((s) => s.count)
+    return <div>count1: {c}</div>
+  }
+
+  function Count2() {
+    const c = useStore((s) => s.count)
+    return <div>count2: {c}</div>
+  }
+
+  // Add 1st subscriber.
+  const { findAllByText, rerender } = render(<Count1 />)
+
+  // Replace 1st subscriber with another.
+  rerender(<Count2 />)
+
+  // Add 2 additional subscribers.
+  rerender(
+    <>
+      <Count2 />
+      <Count1 />
+      <Count1 />
+    </>
+  )
+
+  // Call all subscribers
+  act(() => setState({ count: 1 }))
+
+  expect((await findAllByText('count1: 1')).length).toBe(2)
+  expect((await findAllByText('count2: 1')).length).toBe(1)
+})
